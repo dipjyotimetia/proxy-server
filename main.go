@@ -18,44 +18,46 @@ const (
 )
 
 type rateLimiter struct {
-	mu sync.Mutex
-	// The number of requests made in the last second.
-	count int
-	// The time at which the last request was made.
-	lastRequest time.Time
+	mu        sync.Mutex
+	limit     int
+	remaining int
+	lastReset time.Time
 }
 
-func (r *rateLimiter) allow() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+func newRateLimiter(limit int) *rateLimiter {
+	return &rateLimiter{
+		limit:     limit,
+		remaining: limit,
+		lastReset: time.Now(),
+	}
+}
+
+func (rl *rateLimiter) allow() bool {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
 
 	now := time.Now()
-	if now.Sub(r.lastRequest) > time.Second {
-		r.count = 0
+	if now.Sub(rl.lastReset) > 1*time.Second {
+		rl.remaining = rl.limit
+		rl.lastReset = now
 	}
 
-	if r.count >= requestLimit {
+	if rl.remaining == 0 {
 		return false
 	}
 
-	r.count++
-	r.lastRequest = now
-
+	rl.remaining--
 	return true
 }
 
+var backendURLs = map[string]string{
+	"/api/v1/users":    "http://localhost:8081",
+	"/api/v2/products": "http://localhost:8082",
+}
+
 func main() {
-	// Get the URL of the server to proxy.
-	backendHost := "http://localhost:8081"
-
 	// Create a rate limiter.
-	rateLimiter := &rateLimiter{}
-
-	// Create a reverse proxy.
-	reverseProxy := httputil.NewSingleHostReverseProxy(&url.URL{
-		Scheme: "http",
-		Host:   backendHost,
-	})
+	rateLimiter := newRateLimiter(requestLimit)
 
 	// Create a server to handle requests.
 	server := &http.Server{
@@ -63,10 +65,20 @@ func main() {
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Check if the request is allowed.
 			if !rateLimiter.allow() {
-				http.Error(w, "Too many requests", http.StatusTooManyRequests)
+				w.WriteHeader(http.StatusTooManyRequests)
 				return
 			}
-
+			// Get the backend URL for the requested API path.
+			backendURL, ok := backendURLs[r.URL.Path]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			// Create a reverse proxy.
+			reverseProxy := httputil.NewSingleHostReverseProxy(&url.URL{
+				Scheme: "http",
+				Host:   backendURL,
+			})
 			// Forward the request to the backend server.
 			reverseProxy.ServeHTTP(w, r)
 		}),
