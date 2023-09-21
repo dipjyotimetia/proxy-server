@@ -2,14 +2,16 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/signal"
-	"sync"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -18,36 +20,45 @@ const (
 )
 
 type rateLimiter struct {
-	mu        sync.Mutex
-	limit     int
-	remaining int
-	lastReset time.Time
+	redisClient *redis.Client
+	limit       int
 }
 
-func newRateLimiter(limit int) *rateLimiter {
+func newRateLimiter(redisClient *redis.Client, limit int) *rateLimiter {
 	return &rateLimiter{
-		limit:     limit,
-		remaining: limit,
-		lastReset: time.Now(),
+		redisClient: redisClient,
+		limit:       limit,
 	}
 }
 
-func (rl *rateLimiter) allow() bool {
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
+func (rl *rateLimiter) allow(apiKey string) bool {
+	// Get the current timestamp.
+	now := time.Now().Unix()
 
-	now := time.Now()
-	if now.Sub(rl.lastReset) > 1*time.Second {
-		rl.remaining = rl.limit
-		rl.lastReset = now
-	}
-
-	if rl.remaining == 0 {
+	// Get the number of requests that have been made in the last second for the given API key.
+	count, err := rl.redisClient.ZCard(context.Background(), fmt.Sprintf("rate-limiter:%s:%d:%d", apiKey, rl.limit, now)).Result()
+	if err != nil {
+		log.Println(err)
 		return false
 	}
 
-	rl.remaining--
-	return true
+	// If the number of requests is less than the limit, allow the request.
+	if count < int64(rl.limit) {
+		// Add the request to the Redis set.
+		err = rl.redisClient.ZAdd(context.Background(), fmt.Sprintf("rate-limiter:%s:%d:%d", apiKey, rl.limit, now), redis.Z{
+			Score:  float64(now),
+			Member: "1",
+		}).Err()
+		if err != nil {
+			log.Println(err)
+			return false
+		}
+
+		return true
+	}
+
+	// Otherwise, the request is not allowed.
+	return false
 }
 
 var backendURLs = map[string]string{
@@ -56,16 +67,21 @@ var backendURLs = map[string]string{
 }
 
 func main() {
-	// Create a rate limiter.
-	rateLimiter := newRateLimiter(requestLimit)
+	// Create a new Redis connection.
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: os.Getenv("REDIS_ADDR"),
+	})
+
+	// Create a new rate limiter using the Redis connection.
+	rateLimiter := newRateLimiter(redisClient, requestLimit)
 
 	// Create a server to handle requests.
 	server := &http.Server{
 		Addr: ":8080",
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Check if the request is allowed.
-			if !rateLimiter.allow() {
-				w.WriteHeader(http.StatusTooManyRequests)
+			if !rateLimiter.allow(r.Header.Get("X-API-Key")) {
+				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
 				return
 			}
 			// Get the backend URL for the requested API path.
