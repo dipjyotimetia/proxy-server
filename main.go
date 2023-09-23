@@ -12,8 +12,8 @@ import (
 )
 
 var backendURLs = map[string]string{
-	"/api/v1/users":    "http://localhost:8081",
-	"/api/v2/products": "http://localhost:8082",
+	"/v2/beers":        "api.punkapi.com",
+	"/api/v2/products": "api.punkapi.com",
 }
 
 func main() {
