@@ -2,125 +2,130 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
 	"os"
-	"os/signal"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-const (
-	// The maximum number of requests allowed per second.
-	requestLimit = 100
-)
+type Subscription struct {
+	ClientID string `json:"client_id"`
+	Plan     string `json:"plan"`
+	Limit    int64  `json:"limit"`
+}
 
-type rateLimiter struct {
+type RateLimiter struct {
 	redisClient *redis.Client
-	limit       int
 }
 
-func newRateLimiter(redisClient *redis.Client, limit int) *rateLimiter {
-	return &rateLimiter{
+func NewRateLimiter(redisClient *redis.Client) *RateLimiter {
+	return &RateLimiter{
 		redisClient: redisClient,
-		limit:       limit,
 	}
 }
 
-func (rl *rateLimiter) allow(apiKey string) bool {
-	// Get the current timestamp.
-	now := time.Now().Unix()
-
-	// Get the number of requests that have been made in the last second for the given API key.
-	count, err := rl.redisClient.ZCard(context.Background(), fmt.Sprintf("rate-limiter:%s:%d:%d", apiKey, rl.limit, now)).Result()
+func (r *RateLimiter) Allow(ctx context.Context, key string, limit int64, duration time.Duration) error {
+	// Use the INCRBY command to increment by 1 and get the new count.
+	newCount, err := r.redisClient.IncrBy(ctx, key, 1).Result()
 	if err != nil {
-		log.Println(err)
-		return false
+		return err
 	}
 
-	// If the number of requests is less than the limit, allow the request.
-	if count < int64(rl.limit) {
-		// Add the request to the Redis set.
-		err = rl.redisClient.ZAdd(context.Background(), fmt.Sprintf("rate-limiter:%s:%d:%d", apiKey, rl.limit, now), redis.Z{
-			Score:  float64(now),
-			Member: "1",
-		}).Err()
+	if newCount > limit {
+		// Use the EXPIRE command to set the expiration time.
+		err := r.redisClient.Expire(ctx, key, duration).Err()
 		if err != nil {
-			log.Println(err)
-			return false
+			return err
 		}
-
-		return true
+		return fmt.Errorf("rate limit exceeded")
 	}
 
-	// Otherwise, the request is not allowed.
-	return false
+	return nil
+}
+
+type ReverseProxyServer struct {
+	rateLimiter *RateLimiter
+}
+
+func NewReverseProxyServer(rateLimiter *RateLimiter) *ReverseProxyServer {
+	return &ReverseProxyServer{
+		rateLimiter: rateLimiter,
+	}
+}
+
+func (s *ReverseProxyServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Check if the client has a valid subscription
+	subscription, err := GetSubscription(s.rateLimiter.redisClient, r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+
+	// Check if the client has exceeded their rate limit
+	err = s.rateLimiter.Allow(r.Context(), r.URL.Path, subscription.Limit, time.Second)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusTooManyRequests)
+		return
+	}
+
+	backendURL, ok := backendURLs[r.URL.Path]
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+
+	reverseProxy := httputil.NewSingleHostReverseProxy(&url.URL{
+		Scheme: "https",
+		Host:   backendURL,
+	})
+
+	reverseProxy.ServeHTTP(w, r)
+}
+
+// GetSubscription GetSubscription()
+func GetSubscription(redisClient *redis.Client, r *http.Request) (*Subscription, error) {
+	// Get the client ID from the request
+	clientID := r.Header.Get("X-Client-ID")
+
+	// Get the subscription from Redis
+	subscriptionBytes, err := redisClient.Get(r.Context(), clientID).Bytes()
+	if err != nil {
+		return nil, err
+	}
+
+	// Unmarshal the subscription JSON into a Subscription object
+	var subscription Subscription
+	err = json.Unmarshal(subscriptionBytes, &subscription)
+	if err != nil {
+		return nil, err
+	}
+
+	return &subscription, nil
 }
 
 var backendURLs = map[string]string{
-	"/api/v1/users":    "http://localhost:8081",
-	"/api/v2/products": "http://localhost:8082",
+	"/v2/beers":        "api.punkapi.com",
+	"/v2/beers/random": "api.punkapi.com",
 }
 
 func main() {
-	// Create a new Redis connection.
+	// Create a new Redis client
 	redisClient := redis.NewClient(&redis.Options{
 		Addr: os.Getenv("REDIS_ADDR"),
 	})
 
-	// Create a new rate limiter using the Redis connection.
-	rateLimiter := newRateLimiter(redisClient, requestLimit)
+	// Create a new rate limiter
+	rateLimiter := NewRateLimiter(redisClient)
+	// Create a new reverse proxy server
+	reverseProxyServer := NewReverseProxyServer(rateLimiter)
 
-	// Create a server to handle requests.
-	server := &http.Server{
-		Addr: ":8080",
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Check if the request is allowed.
-			if !rateLimiter.allow(r.Header.Get("X-API-Key")) {
-				http.Error(w, http.StatusText(http.StatusTooManyRequests), http.StatusTooManyRequests)
-				return
-			}
-			// Get the backend URL for the requested API path.
-			backendURL, ok := backendURLs[r.URL.Path]
-			if !ok {
-				w.WriteHeader(http.StatusNotFound)
-				return
-			}
-			// Create a reverse proxy.
-			reverseProxy := httputil.NewSingleHostReverseProxy(&url.URL{
-				Scheme: "http",
-				Host:   backendURL,
-			})
-			// Forward the request to the backend server.
-			reverseProxy.ServeHTTP(w, r)
-		}),
-	}
-
-	// Start the server.
-	go func() {
-		log.Println("Starting proxy server on port 8080...")
-		if err := server.ListenAndServe(); err != nil {
-			log.Fatal(err)
-		}
-	}()
-
-	// Handle graceful shutdown.
-	done := make(chan bool)
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, os.Interrupt)
-	go func() {
-		<-quit
-		log.Println("Shutting down proxy server...")
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		server.Shutdown(ctx)
-		close(done)
-	}()
-
-	<-done
-	log.Println("Proxy server stopped.")
+	// Listen for incoming requests
+	log.Println("Listening on port 8080")
+	log.Fatal(http.ListenAndServe(":8080", reverseProxyServer))
 }
